@@ -14,8 +14,19 @@
 
 import json
 import re
+import uuid
 from google.cloud import vision
 from google.cloud import storage
+
+
+def clear_ocr_output_folder(bucket_name: str, prefix: str) -> None:
+    """Deletes all blobs with the given prefix in the specified bucket."""
+    storage_client = storage.Client()
+    bucket = storage_client.get_bucket(bucket_name)
+    blobs = bucket.list_blobs(prefix=prefix)
+    for blob in blobs:
+        blob.delete()
+    print(f"All blobs with prefix '{prefix}' have been deleted from bucket '{bucket_name}'.")
 
 
 def async_document_extract(
@@ -43,9 +54,14 @@ def async_document_extract(
     Returns:
         str: the complete text
     """
+    # Generate a unique identifier for this OCR job
+    unique_id = uuid.uuid4().hex
+    prefix = f"ocr/{unique_id}"
+
+    # Before starting a new OCR job, clear the output folder of previous job results with the same unique ID
+    clear_ocr_output_folder(output_bucket, prefix)
 
     gcs_source_uri = f"gs://{bucket}/{name}"
-    prefix = "ocr"
     gcs_destination_uri = f"gs://{output_bucket}/{prefix}/"
     mime_type = "application/pdf"
     batch_size = 2
@@ -78,38 +94,39 @@ def async_document_extract(
 
 
 def get_ocr_output_from_bucket(gcs_destination_uri: str, bucket_name: str) -> str:
-    """Iterates over blobs in output bucket to get full OCR result.
+    """Iterates over blobs in output bucket to get full OCR result in the correct order.
 
     Arguments:
         gcs_destination_uri: the URI where the OCR output was saved.
         bucket_name: the name of the bucket where the output was saved.
 
     Returns:
-        The full text of the document
+        The full text of the document in the correct order
     """
     storage_client = storage.Client()
-
     match = re.match(r"gs://([^/]+)/(.+)", gcs_destination_uri)
     prefix = match.group(2)
     bucket = storage_client.get_bucket(bucket_name)
 
-    # List objects with the given prefix, filtering out folders.
-    blob_list = [
-        blob
-        for blob in list(bucket.list_blobs(prefix=prefix))
-        if not blob.name.endswith("/")
-    ]
+    blobs = list(bucket.list_blobs(prefix=prefix))
 
-    # Concatenate all text from the blobs
+    def extract_page_number(blob):
+        match = re.search(r'output-(\d+)-to-\d+', blob.name)
+        if match:
+            return int(match.group(1))
+        return -1
+
+    sorted_blobs = sorted(blobs, key=extract_page_number)
+
     complete_text = ""
-    for output in blob_list:
-        json_string = output.download_as_bytes().decode("utf-8")
-        response = json.loads(json_string)
+    for output in sorted_blobs:
+        if not output.name.endswith("/"):  # Filter out directories
+            json_string = output.download_as_bytes().decode("utf-8")
+            response = json.loads(json_string)
 
-        # The actual response for the first page of the input file.
-        page_response = response["responses"][0]
-        annotation = page_response["fullTextAnnotation"]
-
-        complete_text = complete_text + annotation["text"]
+            for page_response in response.get('responses', []):
+                if 'fullTextAnnotation' in page_response:
+                    annotation = page_response['fullTextAnnotation']
+                    complete_text += annotation.get('text', '')
 
     return complete_text
